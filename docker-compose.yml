@@ -1,0 +1,24 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: redline-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: redline
+      POSTGRES_PASSWORD: redline_local_dev
+      POSTGRES_DB: redline
+    ports:
+      # Host port 5433 so this never collides with a Postgres already on 5432.
+      - "5433:5432"
+    volumes:
+      - redline_pgdata:/var/lib/postgresql/data
+      # Files here run once, on first start of an empty database.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U redline -d redline"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  redline_pgdata:
