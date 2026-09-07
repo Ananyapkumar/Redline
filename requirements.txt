@@ -1,0 +1,7 @@
+# Runtime — Day 31
+google-genai>=1.0.0        # Gemini SDK (structured output)
+pydantic>=2.7              # schema definition and validation
+python-dotenv>=1.0         # loads .env into the environment
+
+# Development
+pytest>=8.0
