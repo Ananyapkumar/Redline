@@ -3,5 +3,9 @@ google-genai>=1.0.0        # Gemini SDK (structured output)
 pydantic>=2.7              # schema definition and validation
 python-dotenv>=1.0         # loads .env into the environment
 
+# Runtime — Day 32
+psycopg[binary]>=3.2       # Postgres driver, v3
+httpx>=0.27                # HTTP client with real timeout support
+
 # Development
 pytest>=8.0

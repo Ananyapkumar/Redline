@@ -12,9 +12,45 @@ that produced it, and a fabricated obligation cannot survive the check.
 
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
+from datetime import date
 from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator
+
+
+@dataclass(frozen=True)
+class SourceDocument:
+    """One document as a watcher found it, before any parsing.
+
+    Lives here rather than in store.py so a source module can describe what it returns
+    without importing a database driver. Data shapes should not depend on where the data
+    happens to be persisted — that coupling is how a project ends up unable to unit-test
+    its HTTP layer without a running Postgres.
+    """
+
+    source: str
+    external_id: str
+    title: str
+    doc_type: str | None
+    published_on: date | None
+    html_url: str | None
+    pdf_url: str | None
+    abstract: str | None
+    agencies: list[str]
+
+    @property
+    def content_hash(self) -> str:
+        """Stable fingerprint of identity, used for deduplication.
+
+        Built from source + external_id + title rather than from the document's full
+        text: the watcher only sees metadata, and downloading every document just to
+        decide whether it is new would be slow and wasteful. A revised document receives
+        a new external_id from the Federal Register, so genuine revisions are still seen.
+        """
+        payload = f"{self.source}|{self.external_id}|{self.title}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 class ObligedParty(str, Enum):
