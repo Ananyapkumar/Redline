@@ -26,6 +26,7 @@ def _float(name: str, default: float) -> float:
 class Settings:
     gemini_api_key: str
     gemini_model: str
+    embedding_model: str
     database_url: str
 
     # Run limits — ADR-001 D6
@@ -53,6 +54,10 @@ class Settings:
     # obediently waits 20 minutes has hung, as far as anyone watching is concerned.
     max_backoff_seconds: float
 
+    # Embedding a whole corpus is many calls. Budgeted separately from extraction so one
+    # runaway indexing job cannot consume the quota the agent needs.
+    max_embedding_calls: int
+
 
 def load_settings() -> Settings:
     # Deliberately does NOT raise on a missing key. Importing this module must never
@@ -61,6 +66,7 @@ def load_settings() -> Settings:
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
+        embedding_model=os.getenv("EMBEDDING_MODEL", "gemini-embedding-001"),
         database_url=os.getenv(
             "DATABASE_URL",
             "postgresql://redline:redline_local_dev@localhost:5433/redline",
@@ -73,6 +79,7 @@ def load_settings() -> Settings:
         transient_backoff_seconds=_float("TRANSIENT_BACKOFF_SECONDS", 2.0),
         max_model_calls_per_run=_int("MAX_MODEL_CALLS_PER_RUN", 6),
         max_backoff_seconds=_float("MAX_BACKOFF_SECONDS", 60.0),
+        max_embedding_calls=_int("MAX_EMBEDDING_CALLS", 60),
     )
 
 

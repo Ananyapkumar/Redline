@@ -64,6 +64,44 @@ CREATE TABLE IF NOT EXISTS document_sections (
 );
 
 CREATE INDEX IF NOT EXISTS document_sections_doc_idx ON document_sections (document_id, ordinal);
+
+-- One row per retrievable unit, from either corpus.
+--
+-- corpus = 'policy'     -> ref is a clause id, "P-002 §2.2". These are the things the
+--                          agent cites, so ref must be exact and stable.
+-- corpus = 'regulation' -> ref is a section label within a regulatory document.
+--
+-- Both live in one table so a single query can search either or both, and so the
+-- embedding dimension is enforced in one place.
+CREATE TABLE IF NOT EXISTS chunks (
+    id            BIGSERIAL PRIMARY KEY,
+    corpus        TEXT          NOT NULL CHECK (corpus IN ('policy', 'regulation')),
+    ref           TEXT,
+    context       TEXT          NOT NULL,
+    body          TEXT          NOT NULL,
+    text          TEXT          NOT NULL,   -- context + body; exactly what was embedded
+    part          INT           NOT NULL DEFAULT 0,
+    of_parts      INT           NOT NULL DEFAULT 1,
+    source_id     BIGINT,                   -- source_documents.id, for regulation chunks
+    embedding     vector(1536),
+    indexed_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    -- Re-indexing must replace, never duplicate.
+    CONSTRAINT chunks_identity_key UNIQUE (corpus, ref, part)
+);
+
+CREATE INDEX IF NOT EXISTS chunks_corpus_idx ON chunks (corpus);
+
+-- Approximate nearest-neighbour index. Without it every search is a full scan: fine at
+-- 131 rows, unusable later. HNSW caps at 2000 dimensions, which is why embeddings are
+-- requested at 1536 rather than the model default of 3072.
+CREATE INDEX IF NOT EXISTS chunks_embedding_idx
+    ON chunks USING hnsw (embedding vector_cosine_ops);
+
+-- Keyword half of hybrid retrieval, ready for Day 39. Built now because it costs nothing
+-- and needs the same table.
+CREATE INDEX IF NOT EXISTS chunks_fts_idx
+    ON chunks USING gin (to_tsvector('english', text));
 """
 
 
@@ -197,3 +235,107 @@ def section_stats(conn: psycopg.Connection) -> dict:
         """
     ).fetchone()
     return dict(row)
+
+
+# --- chunks -----------------------------------------------------------------
+
+
+def upsert_chunk(conn: psycopg.Connection, corpus: str, chunk, embedding: list[float],
+                 source_id: int | None = None) -> None:
+    """Store one chunk and its vector, replacing any previous version of the same unit.
+
+    ON CONFLICT ... DO UPDATE rather than DO NOTHING: re-indexing after a chunking change
+    must overwrite. Skipping silently would leave the old vector attached to new text.
+    """
+    conn.execute(
+        """
+        INSERT INTO chunks (corpus, ref, context, body, text, part, of_parts,
+                            source_id, embedding, indexed_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (corpus, ref, part) DO UPDATE SET
+            context = EXCLUDED.context, body = EXCLUDED.body, text = EXCLUDED.text,
+            of_parts = EXCLUDED.of_parts, source_id = EXCLUDED.source_id,
+            embedding = EXCLUDED.embedding, indexed_at = now()
+        """,
+        (corpus, chunk.ref, chunk.context, chunk.body, chunk.text,
+         chunk.part, chunk.of_parts, source_id, str(embedding)),
+    )
+
+
+def search_chunks(conn: psycopg.Connection, query_embedding: list[float],
+                  corpus: str | None = None, limit: int = 10) -> list[dict]:
+    """Nearest neighbours by cosine distance.
+
+    pgvector's <=> operator returns cosine DISTANCE: 0 is identical, 2 is opposite. It is
+    converted to a similarity here so the number reads the way people expect, while the
+    ORDER BY still uses the raw distance — that is what the HNSW index can accelerate.
+    An ORDER BY over the derived similarity would silently fall back to a full scan.
+    """
+    vector = str(query_embedding)
+    if corpus:
+        sql = """
+            SELECT ref, context, body, part, of_parts, corpus,
+                   1 - (embedding <=> %(v)s::vector) AS similarity
+            FROM chunks
+            WHERE corpus = %(corpus)s AND embedding IS NOT NULL
+            ORDER BY embedding <=> %(v)s::vector
+            LIMIT %(limit)s
+        """
+        params = {"v": vector, "corpus": corpus, "limit": limit}
+    else:
+        sql = """
+            SELECT ref, context, body, part, of_parts, corpus,
+                   1 - (embedding <=> %(v)s::vector) AS similarity
+            FROM chunks
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> %(v)s::vector
+            LIMIT %(limit)s
+        """
+        params = {"v": vector, "limit": limit}
+    return conn.execute(sql, params).fetchall()
+
+
+def index_is_ready(conn: psycopg.Connection) -> tuple[bool, str]:
+    """Is there anything to search? Returns (ready, reason).
+
+    Added on Day 35 after `search.py` answered "have you indexed anything yet?" with a
+    psycopg traceback about a missing relation. A tool that fails should say what to do
+    next — the same rule the extractor follows for a missing API key.
+    """
+    exists = conn.execute(
+        "SELECT to_regclass('public.chunks') IS NOT NULL AS present"
+    ).fetchone()["present"]
+    if not exists:
+        return False, ("The chunks table does not exist yet — nothing has been indexed. "
+                       "Run: python scripts/index_corpus.py policy")
+
+    n = conn.execute(
+        "SELECT count(*) AS n FROM chunks WHERE embedding IS NOT NULL"
+    ).fetchone()["n"]
+    if not n:
+        return False, ("The chunks table exists but holds no embeddings. "
+                       "Run: python scripts/index_corpus.py policy")
+    return True, f"{n} embedded chunks"
+
+
+def chunk_stats(conn: psycopg.Connection) -> list[dict]:
+    return conn.execute(
+        """
+        SELECT corpus,
+               count(*)                              AS chunks,
+               count(*) FILTER (WHERE of_parts > 1)  AS split_chunks,
+               round(avg(length(body)))              AS avg_body_chars,
+               max(length(body))                     AS max_body_chars,
+               count(*) FILTER (WHERE embedding IS NULL) AS unembedded
+        FROM chunks GROUP BY corpus ORDER BY corpus
+        """
+    ).fetchall()
+
+
+def existing_chunk_refs(conn: psycopg.Connection, corpus: str) -> set[str]:
+    """Refs already embedded, so re-running indexing skips work rather than repeating it."""
+    rows = conn.execute(
+        "SELECT DISTINCT ref FROM chunks WHERE corpus = %s AND embedding IS NOT NULL",
+        (corpus,),
+    ).fetchall()
+    return {r["ref"] for r in rows if r["ref"]}

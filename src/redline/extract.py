@@ -17,117 +17,22 @@ than one that stops.
 
 from __future__ import annotations
 
-import random
 import re
-import time
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
 from redline.config import require_api_key, settings
+from redline.resilience import (  # re-exported so existing imports keep working
+    CallBudget as _CallBudget,
+    ModelUnavailable,
+    call_with_backoff,
+    is_rate_limit as _is_rate_limit,
+    is_transient as _is_transient,
+    suggested_delay as _suggested_delay,
+    suggested_replacement_model as _suggested_replacement_model,
+)
 from redline.schemas import ExtractionResult
-
-
-class ModelUnavailable(RuntimeError):
-    """The API could not be reached, or kept failing, after the transport retry budget.
-
-    Deliberately a different exception from ExtractionFailed. They mean different things
-    and a caller should treat them differently: this one says "come back later", the
-    other says "this passage could not be extracted correctly". A scheduled run should
-    dead-letter and retry on this; on the other, it should not bother retrying.
-    """
-
-
-class ExtractionFailed(RuntimeError):
-    """Raised when the model could not produce a valid, grounded result in budget.
-
-    Carries the attempt history so the failure can be diagnosed rather than guessed at.
-    """
-
-    def __init__(self, message: str, attempts: list[str]) -> None:
-        super().__init__(message)
-        self.attempts = attempts
-
-
-@dataclass
-class ExtractionRun:
-    """What happened during one call to extract_obligations.
-
-    Kept separate from the result so that reliability data — how many retries, which
-    errors — is available to the caller without polluting the domain objects. On Day 51
-    this is what gets written to the trace.
-    """
-
-    result: ExtractionResult
-    attempts_used: int
-    errors_encountered: list[str] = field(default_factory=list)
-    transient_retries: int = 0  # how many times the API itself had to be re-tried
-
-
-SYSTEM_PROMPT = """\
-You are a regulatory analyst. You extract discrete legal obligations from regulatory text.
-
-Rules you must follow:
-
-1. Extract every DISTINCT obligation. A paragraph with sub-points (a), (b), (c) usually
-   contains one obligation per sub-point, not one for the paragraph.
-2. `verbatim_quote` must be copied EXACTLY from the passage, character for character.
-   Do not paraphrase it. Do not tidy the punctuation. Do not join text from two places
-   with an ellipsis. If you cannot quote it exactly, do not report the obligation.
-3. `action` states the duty in under 15 words. It is not a summary of the clause.
-4. Take `modality` from the operative verb: "shall" is mandatory, "shall not" is
-   prohibited, "may" is permitted, "should" is recommended. Where the duty applies only
-   under a stated condition, use conditional.
-5. If the passage is definitional, procedural or introductory and imposes no duty at all,
-   return an empty obligations list and set passage_contains_no_obligations to true.
-   That is a correct answer, not a failure.
-6. Do not infer obligations that the text does not state. Do not import knowledge of the
-   regulation from memory. Only what is in the passage in front of you.
-"""
-
-
-def _normalise(text: str) -> str:
-    """Collapse whitespace so quote matching survives line wrapping and PDF artefacts.
-
-    A quote copied from a PDF often differs from the source only by where the line
-    breaks fell. Comparing normalised strings catches genuine fabrication while
-    tolerating harmless reflowing. Curly quotes and dashes are folded for the same reason.
-    """
-    text = text.replace("’", "'").replace("‘", "'")
-    text = text.replace("“", '"').replace("”", '"')
-    text = text.replace("—", "-").replace("–", "-").replace("‑", "-")
-    text = text.replace(" ", " ")
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def _check_grounding(result: ExtractionResult, source_text: str) -> list[str]:
-    """Verify every quote exists in the source. Returns a list of problems, empty if clean.
-
-    This is the check that makes the difference between "the model said so" and
-    "the document says so".
-    """
-    haystack = _normalise(source_text)
-    problems: list[str] = []
-    for ob in result.obligations:
-        needle = _normalise(ob.verbatim_quote)
-        if needle not in haystack:
-            problems.append(
-                f"{ob.source_ref}: verbatim_quote does not appear in the source passage. "
-                f"You wrote: {ob.verbatim_quote[:120]!r}. "
-                "Copy the exact wording from the passage."
-            )
-    return problems
-
-
-def _check_consistency(result: ExtractionResult) -> list[str]:
-    """Cross-field rules Pydantic cannot express on a single field."""
-    problems: list[str] = []
-    if result.passage_contains_no_obligations and result.obligations:
-        problems.append(
-            "passage_contains_no_obligations is true but obligations is not empty. "
-            "Choose one: either the passage imposes duties, or it does not."
-        )
-    return problems
 
 
 def _client():
@@ -240,103 +145,9 @@ class _CallBudget:
 
 
 def _call_model_resilient(client, prompt: str, budget: _CallBudget) -> tuple[str, int]:
-    """Call the model, waiting and resending if the API itself fails.
+    """Call the model through the shared backoff policy in redline.resilience."""
+    return call_with_backoff(lambda: _call_model(client, prompt), budget, label="extraction")
 
-    This is NOT the same retry as the one in extract_obligations. That one changes the
-    prompt because the model produced something wrong. This one resends the identical
-    prompt because the model never got a chance to answer. Conflating them would mean
-    telling a server that returned HTTP 500 that its quote was ungrounded — nonsense.
-
-    Backoff is exponential with jitter: waits of roughly 2s, 4s, 8s, each nudged by a
-    random fraction. The jitter matters when many requests fail at once — without it
-    they all wake up together and hammer the recovering service in lockstep.
-
-    Returns:
-        (raw response text, number of transient retries it took)
-    """
-    last: Exception | None = None
-    for attempt in range(1, settings.transient_max_attempts + 1):
-        budget.spend()
-        try:
-            return _call_model(client, prompt), attempt - 1
-        except Exception as exc:  # noqa: BLE001 - classified immediately below
-            if not _is_transient(exc):
-                # Permanent: bad key, malformed request, retired model. Retrying cannot
-                # help, so fail now rather than spending the budget proving it.
-                replacement = _suggested_replacement_model(exc)
-                if replacement:
-                    raise ModelUnavailable(
-                        f"Model '{settings.gemini_model}' is retired or unavailable to "
-                        f"this account. The API recommends '{replacement}'. "
-                        f"Set GEMINI_MODEL={replacement} in .env. Original error: {exc}"
-                    ) from exc
-                raise
-            last = exc
-
-            # A quota error is not a hiccup. Retrying into a rate limit consumes the
-            # very budget that is exhausted, and on a hard daily cap no amount of
-            # waiting inside this run will help. Surface it immediately with the
-            # server's own advice rather than burning three more requests.
-            if _is_rate_limit(exc):
-                hint = _suggested_delay(exc)
-                raise ModelUnavailable(
-                    f"Rate limited or out of quota on '{settings.gemini_model}'. "
-                    + (
-                        f"The server asks you to wait {hint:.0f}s. "
-                        if hint
-                        else ""
-                    )
-                    + f"Original error: {exc}"
-                ) from exc
-
-            if attempt == settings.transient_max_attempts:
-                break
-
-            # Obey the server if it told us how long to wait; otherwise back off
-            # exponentially with jitter. Either way, never longer than the cap.
-            delay = _suggested_delay(exc)
-            if delay is None:
-                delay = settings.transient_backoff_seconds * (2 ** (attempt - 1))
-                delay *= 1 + random.random() * 0.25
-            delay = min(delay, settings.max_backoff_seconds)
-            print(
-                f"  [transient] {type(exc).__name__}: retrying in {delay:.1f}s "
-                f"(attempt {attempt}/{settings.transient_max_attempts}, "
-                f"calls used {budget.used}/{budget.limit})"
-            )
-            time.sleep(delay)
-
-    raise ModelUnavailable(
-        f"Model '{settings.gemini_model}' unavailable after "
-        f"{settings.transient_max_attempts} attempts. Last error: {last}"
-    ) from last
-
-
-def _call_model(client, prompt: str) -> str:
-    """The single place the model API is touched.
-
-    Isolated deliberately: if the SDK's call signature changes, or you swap providers,
-    exactly one function needs editing rather than the whole module.
-
-    If your installed google-genai is older and has no `interactions`, the equivalent is:
-        resp = client.models.generate_content(
-            model=settings.gemini_model,
-            contents=prompt,
-            config={"response_mime_type": "application/json",
-                    "response_schema": ExtractionResult},
-        )
-        return resp.text
-    """
-    interaction = client.interactions.create(
-        model=settings.gemini_model,
-        input=prompt,
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": ExtractionResult.model_json_schema(),
-        },
-    )
-    return interaction.output_text
 
 
 def extract_obligations(source_text: str, source_ref_hint: str = "") -> ExtractionRun:
