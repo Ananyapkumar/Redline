@@ -96,3 +96,72 @@ Recall@10 on straightforward queries should be high; the corpus is small and the
 prefix is doing real work. The interesting numbers will be the queries where the answer
 spans policies (O2) and the queries with no answer at all (O3). If the golden set contains
 only clean single-answer cases, it will report a flattering number that means nothing.
+
+---
+
+# Day 36 — baseline measured, and a problem with the measurement
+
+```
+recall@1   0.648      recall@10  0.944      MRR 1.000
+mean top score answerable 0.768 · unanswerable 0.620 · separation 0.148
+```
+
+Recorded, committed, unchanged. Then read sceptically.
+
+## O4 — The golden set is contaminated, and the score reflects it
+
+recall@10 of 0.944 on day one, against a Day 41 gate of 0.85. Every answerable case put a
+correct clause at rank 1 (MRR 1.000). That is not a system performing well. That is a test
+that is too easy, and the cause is structural:
+
+**Claude wrote the corpus and Claude wrote the queries.** Compare B05:
+
+```
+query    "Records supporting a claim submitted to a federal health care program
+          shall be retained for a period of ten years from the date of service."
+clause   "Records supporting a claim submitted to a federal health care program
+          shall be retained for a minimum of ten (10) years from the date of service."
+```
+
+Near-verbatim. Retrieved at rank 1, similarity 0.816 — as it would be by any method,
+including keyword matching. This is measuring near-duplicate detection, not retrieval.
+
+Two consequences, one of which threatens the project narrative:
+
+1. **The number is not credible.** An interviewer who reads the golden set will see the
+   same author in both halves within a minute.
+2. **There is no headroom.** Days 39–40 add hybrid retrieval and reranking, and the
+   before/after table was to be the strongest artifact in the repo. From 0.944 the largest
+   possible gain is 0.056, most of it noise at n=10.
+
+**Correction for Day 37: queries come from real regulatory text, not from paraphrase.**
+Twenty Federal Register documents are already stored and normalised, and the Day 31
+extractor already turns regulatory text into structured obligations. Running that over the
+stored documents produces queries in production's own vocabulary, written by federal
+drafters rather than by the same author as the corpus. Harder, uncontaminated, and a closer
+match to what the system will actually receive.
+
+The Day 41 gate of recall@10 ≥ 0.85 is retained but now applies to that set. This baseline
+is kept and labelled for what it is: a floor measured on an easy set.
+
+## O5 — B04 confirms the clustering prediction
+
+The only miss across ten cases:
+
+```
+B04   found P-005 §1.2 (minimum necessary)   missed P-003 §1.1 (least privilege)
+```
+
+The same obligation stated in two policies, in different vocabulary. Retrieval found the
+one whose wording matched and missed the one whose meaning matched. Exactly what Day 35
+observation O2 predicted, now with a case id attached.
+
+## O6 — Separation is larger than the hand check suggested, and still not enough
+
+Day 35 measured a 0.02 gap by hand on one pair. Measured properly: **0.148**, unanswerable
+at 0.620 against an answerable mean of 0.768.
+
+Better than feared, and still not a usable threshold. The lowest answerable score is B08 at
+0.717 and there is one unanswerable case at 0.620 — a gap of 0.097 with a sample of one.
+A threshold set between them would be fitted to a single data point. Day 37 needs several
+unanswerable cases before this number means anything.
