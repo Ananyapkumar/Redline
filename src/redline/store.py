@@ -13,6 +13,7 @@ and still lose that race.
 
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -316,6 +317,87 @@ def index_is_ready(conn: psycopg.Connection) -> tuple[bool, str]:
         return False, ("The chunks table exists but holds no embeddings. "
                        "Run: python scripts/index_corpus.py policy")
     return True, f"{n} embedded chunks"
+
+
+def _or_tsquery(text: str) -> str:
+    """Build an OR-ed tsquery from free text.
+
+    Day 40 bug, and a silent one. The first version used websearch_to_tsquery, which joins
+    every term with AND. The queries here are whole regulatory sentences — forty-odd words —
+    so the query became a forty-term conjunction that matched NOTHING. Keyword search
+    returned an empty list, RRF had only the vector ranking to fuse, and hybrid mode
+    produced results byte-identical to vector mode.
+
+    Nothing errored. Three eval runs reported the same numbers and looked like evidence that
+    hybrid retrieval does not help, when in fact hybrid retrieval was never running.
+
+    OR is the right operator for retrieval: a document matching five of forty terms is a
+    good candidate, and ts_rank_cd scores it by how many and how prominently. AND is for
+    filtering, not ranking.
+    """
+    # Drop punctuation, short tokens and the handful of words that match everything.
+    stop = {
+        "the", "and", "for", "that", "with", "shall", "must", "any", "all", "not",
+        "this", "such", "which", "from", "under", "upon", "each", "may", "are", "was",
+        "been", "have", "has", "will", "would", "its", "their", "other", "than",
+    }
+    words = re.findall(r"[A-Za-z][A-Za-z0-9]{2,}", text.lower())
+    terms = [w for w in dict.fromkeys(words) if w not in stop][:40]
+    return " | ".join(terms)
+
+
+def search_keyword(conn: psycopg.Connection, query: str,
+                   corpus: str | None = None, limit: int = 30) -> list[dict]:
+    """Full-text search over the same chunks, using the GIN index built on Day 35.
+
+    Why regulatory text needs this alongside vector search: an embedding understands that
+    "twelve months" and "one year" mean the same thing, which is usually an advantage and
+    occasionally a disaster. A compliance clause turns on the exact figure. Keyword search
+    has the opposite bias — blind to meaning, exact about tokens. Neither is right alone.
+    """
+    tsquery = _or_tsquery(query)
+    if not tsquery:
+        return []
+
+    where = "WHERE corpus = %(corpus)s AND" if corpus else "WHERE"
+    sql = f"""
+        SELECT ref, context, body, part, of_parts, corpus,
+               ts_rank_cd(to_tsvector('english', text),
+                          to_tsquery('english', %(q)s)) AS rank
+        FROM chunks
+        {where} to_tsvector('english', text) @@ to_tsquery('english', %(q)s)
+        ORDER BY rank DESC
+        LIMIT %(limit)s
+    """
+    params = {"q": tsquery, "limit": limit}
+    if corpus:
+        params["corpus"] = corpus
+    return conn.execute(sql, params).fetchall()
+
+
+def search_vector_with_embeddings(conn: psycopg.Connection, query_embedding: list[float],
+                                  corpus: str | None = None,
+                                  limit: int = 30) -> list[dict]:
+    """Vector search that also returns each chunk's embedding.
+
+    Needed by the reranker, which measures how similar candidates are to EACH OTHER. The
+    plain search omits embeddings because they are large and usually unwanted.
+    """
+    vector = str(query_embedding)
+    where = "WHERE corpus = %(corpus)s AND embedding IS NOT NULL" if corpus \
+        else "WHERE embedding IS NOT NULL"
+    sql = f"""
+        SELECT ref, context, body, part, of_parts, corpus, embedding,
+               1 - (embedding <=> %(v)s::vector) AS similarity
+        FROM chunks
+        {where}
+        ORDER BY embedding <=> %(v)s::vector
+        LIMIT %(limit)s
+    """
+    params = {"v": vector, "limit": limit}
+    if corpus:
+        params["corpus"] = corpus
+    return conn.execute(sql, params).fetchall()
 
 
 def chunk_stats(conn: psycopg.Connection) -> list[dict]:

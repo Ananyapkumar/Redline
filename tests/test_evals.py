@@ -62,8 +62,12 @@ def test_unanswerable_cases_are_excluded_from_recall():
     assert s["score_separation"] == 0.2
 
 
-def test_separation_is_reported_only_when_both_kinds_are_present():
-    assert "score_separation" not in score([case(["A"], ["A"])])
+def test_separation_is_none_when_one_kind_is_missing():
+    """Explicitly None rather than absent: a missing key reads as "not computed", None
+    reads as "cannot be computed from this set". The second is the true statement, and the
+    printer renders it as n/a rather than inventing a 0.000."""
+    assert score([case(["A"], ["A"])])["score_separation"] is None
+    assert score([case([], ["Z"])])["score_separation"] is None
 
 
 # --- the real golden set ------------------------------------------------------

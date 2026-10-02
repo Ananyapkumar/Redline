@@ -132,9 +132,13 @@ def score(results: list[CaseResult], ks: tuple[int, ...] = (1, 3, 5, 10)) -> dic
     if unanswerable:
         summary["mean_top_score_unanswerable"] = round(
             sum(r.top_score for r in unanswerable) / len(unanswerable), 3)
+    # Separation needs BOTH kinds. With only one, there is nothing to separate from, and
+    # reporting a number would invent a contrast that was never measured.
     if answerable and unanswerable:
         summary["score_separation"] = round(
             summary["mean_top_score_answerable"] - summary["mean_top_score_unanswerable"], 3)
+    else:
+        summary["score_separation"] = None
 
     return summary
 
