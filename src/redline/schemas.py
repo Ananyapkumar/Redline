@@ -204,3 +204,88 @@ class ExtractionResult(BaseModel):
                 "Each obligation needs its own distinct citation."
             )
         return v
+
+
+# =============================================================================
+# Agent output — Days 44-48
+# =============================================================================
+
+
+class ImpactVerdict(str, Enum):
+    """What a regulatory obligation does to one internal policy clause."""
+
+    AFFECTED = "affected"            # the clause must change, or is directly engaged
+    NOT_AFFECTED = "not_affected"    # retrieved, read, and genuinely unrelated
+    AMBIGUOUS = "ambiguous"          # cannot be decided from the text available
+
+
+class Severity(str, Enum):
+    HIGH = "high"       # non-compliance is likely and consequential
+    MEDIUM = "medium"   # the clause needs amendment but exposure is limited
+    LOW = "low"         # wording alignment, no substantive gap
+    NONE = "none"
+
+
+class ClauseAssessment(BaseModel):
+    """The agent's judgement on one candidate clause."""
+
+    clause_id: str = Field(
+        description="Exactly as given in the candidate list, e.g. 'P-002 §2.2'. Never invent one."
+    )
+    verdict: ImpactVerdict
+    severity: Severity = Field(
+        default=Severity.NONE,
+        description="Only meaningful when verdict is 'affected'. Use 'none' otherwise."
+    )
+    reasoning: str = Field(
+        description=(
+            "One or two sentences on WHY, referring to what the clause says and what the "
+            "obligation requires. Not a restatement of either."
+        )
+    )
+    proposed_text: str | None = Field(
+        default=None,
+        description=(
+            "When verdict is 'affected': the full amended clause text, ready for review. "
+            "Change as little as possible. Null for any other verdict."
+        ),
+    )
+
+    @field_validator("reasoning")
+    @classmethod
+    def reasoning_must_be_substantive(cls, v: str) -> str:
+        if len(v.strip()) < 30:
+            raise ValueError(
+                f"reasoning is {len(v.strip())} chars. State why the clause is or is not "
+                "engaged — a verdict without a reason cannot be reviewed."
+            )
+        return v.strip()
+
+
+class ImpactAnalysis(BaseModel):
+    """Everything the agent concluded about one obligation.
+
+    One model call produces this whole object: assessments for every candidate clause plus
+    the drafted amendments. Splitting judgement and drafting into separate calls would
+    double the quota cost for no gain, because drafting needs the same reasoning that
+    produced the verdict.
+    """
+
+    assessments: list[ClauseAssessment] = Field(
+        description="One entry per candidate clause considered. Do not omit any."
+    )
+    ambiguity_note: str | None = Field(
+        default=None,
+        description=(
+            "Set only when something about the obligation itself cannot be resolved from "
+            "the corpus — e.g. it defers to a document that is not present. Null otherwise."
+        ),
+    )
+
+    @property
+    def affected(self) -> list[ClauseAssessment]:
+        return [a for a in self.assessments if a.verdict == ImpactVerdict.AFFECTED]
+
+    @property
+    def ambiguous(self) -> list[ClauseAssessment]:
+        return [a for a in self.assessments if a.verdict == ImpactVerdict.AMBIGUOUS]

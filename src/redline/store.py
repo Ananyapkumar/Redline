@@ -103,6 +103,33 @@ CREATE INDEX IF NOT EXISTS chunks_embedding_idx
 -- and needs the same table.
 CREATE INDEX IF NOT EXISTS chunks_fts_idx
     ON chunks USING gin (to_tsvector('english', text));
+
+-- Every agent decision, kept whether it was auto-filed or routed to a human.
+--
+-- Storing the abstentions matters as much as storing the answers. "How often does it
+-- decline, and on what?" is the first question a compliance team will ask, and a system
+-- that only records its successes cannot answer it.
+CREATE TABLE IF NOT EXISTS agent_runs (
+    id              BIGSERIAL PRIMARY KEY,
+    obligation      TEXT        NOT NULL,
+    obligation_hash TEXT        NOT NULL,
+    route           TEXT        NOT NULL,   -- auto_filed | human_review
+    confidence      REAL        NOT NULL,
+    reason          TEXT        NOT NULL,   -- the derivation, not a label
+    top_score       REAL,
+    margin          REAL,
+    model_calls     INT         NOT NULL DEFAULT 0,
+    affected        TEXT[]      NOT NULL DEFAULT '{}',
+    analysis        JSONB,
+    retrieval_mode  TEXT,
+    ran_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Re-running the same obligation replaces its record rather than accumulating
+    -- duplicates. (ADR-001 D6)
+    CONSTRAINT agent_runs_obligation_key UNIQUE (obligation_hash)
+);
+
+CREATE INDEX IF NOT EXISTS agent_runs_route_idx ON agent_runs (route, ran_at DESC);
 """
 
 
@@ -421,3 +448,49 @@ def existing_chunk_refs(conn: psycopg.Connection, corpus: str) -> set[str]:
         (corpus,),
     ).fetchall()
     return {r["ref"] for r in rows if r["ref"]}
+
+
+# --- agent runs --------------------------------------------------------------
+
+
+def save_agent_run(conn: psycopg.Connection, result, mode: str) -> None:
+    """Persist one decision, including the abstentions."""
+    import hashlib
+    import json
+
+    digest = hashlib.sha256(result.obligation.encode("utf-8")).hexdigest()
+    analysis = (
+        json.dumps(result.analysis.model_dump(mode="json")) if result.analysis else None
+    )
+    conn.execute(
+        """
+        INSERT INTO agent_runs (obligation, obligation_hash, route, confidence, reason,
+                                top_score, margin, model_calls, affected, analysis,
+                                retrieval_mode, ran_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+        ON CONFLICT (obligation_hash) DO UPDATE SET
+            route = EXCLUDED.route, confidence = EXCLUDED.confidence,
+            reason = EXCLUDED.reason, top_score = EXCLUDED.top_score,
+            margin = EXCLUDED.margin, model_calls = EXCLUDED.model_calls,
+            affected = EXCLUDED.affected, analysis = EXCLUDED.analysis,
+            retrieval_mode = EXCLUDED.retrieval_mode, ran_at = now()
+        """,
+        (result.obligation, digest, result.route, result.confidence, result.reason,
+         result.top_score, result.margin, result.model_calls,
+         result.affected_clauses, analysis, mode),
+    )
+
+
+def agent_stats(conn: psycopg.Connection) -> dict:
+    row = conn.execute(
+        """
+        SELECT count(*)                                            AS runs,
+               count(*) FILTER (WHERE route = 'auto_filed')         AS auto_filed,
+               count(*) FILTER (WHERE route = 'human_review')       AS routed,
+               count(*) FILTER (WHERE model_calls = 0)              AS abstained_free,
+               coalesce(sum(model_calls), 0)                        AS model_calls,
+               coalesce(round(avg(confidence)::numeric, 3), 0)      AS mean_confidence
+        FROM agent_runs
+        """
+    ).fetchone()
+    return dict(row)

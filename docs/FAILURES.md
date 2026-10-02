@@ -112,3 +112,46 @@ harder to verify.
 **Deliberately unresolved.** Belongs in the golden set as a labelling decision on Day 37 —
 what the correct answer *is* must be settled before measuring whether the system gives it.
 **Status:** Open, logged, needs a labelling decision before it needs a code change.
+
+
+### Q5 — Confidence was inverted: the agent was most confident when it was least complete
+**Observed:** Day 48, by joining stored agent decisions to the golden labels.
+
+```
+auto-filed       n=3   mean precision 1.00   mean recall 0.50   exact 0/3
+routed to human  n=6   mean precision 1.00   mean recall 0.78   exact 3/6
+```
+
+The cases the agent was most confident about were *less* correct than the ones it declined.
+
+**Cause, in two linked parts.**
+
+*The judgement.* Precision was 1.00 everywhere — no clause was ever wrongly named. Recall was
+0.50 on multi-clause obligations. The system prompt contained the line "not_affected — this
+will be the correct verdict for most candidates", written to prevent over-matching. It
+over-corrected: the agent found the strongest match and marked the rest not_affected. Every
+case that achieved recall 1.00 was a single-clause obligation.
+
+*The score.* Confidence was derived largely from retrieval top-score, which measures "is
+there one obvious match". For an obligation that engages several clauses, one obvious match
+is precisely the condition under which the agent latches onto it and misses the others. So
+the signal was **anti-correlated** with the thing it claimed to measure.
+
+**Why it was invisible until measured.** Every individual output looked right. The reasoning
+was sound, the citations all validated, precision was perfect. Nothing in any single result
+revealed that a second affected clause existed and had been dismissed. Only joining the
+decisions to hand-labelled ground truth exposed it.
+
+**Fix applied:** the prompt now states that one obligation usually engages several clauses
+across different policies, requires a second pass over the not_affected set looking for the
+same duty in different vocabulary, and states the cost asymmetry explicitly — a clause
+wrongly included costs seconds, a clause missed is an unmet obligation nobody knows about.
+
+**Deliberately NOT fixed yet:** the confidence formula. Recalibrating it against outcomes
+produced by a broken judgement would fit the new formula to the old bug. Re-measure after
+the prompt change, then recalibrate.
+
+**Generalisable lesson.** A confidence signal has to be validated against outcomes, not
+assumed from plausibility. "Top retrieval score" sounds like a reasonable proxy for
+certainty and is in fact a proxy for *one strong match*, which on a completeness task is
+closer to a warning sign than a reassurance.
